@@ -148,12 +148,48 @@ drift apart. See `docs/adr/0003` for why production needs `SameSite=None`.
 
 | Method & path | Auth | Body | Notes |
 |---|---|---|---|
-| `POST /appointments` | patient | `{ availabilitySlotId }` | **The concurrency-critical endpoint** — see `ARCHITECTURE.md` §5.1 and `backend/tests/integration/booking.test.mts`. `409` if the slot is no longer open. |
+| `POST /appointments` | patient (verified email) | `{ availabilitySlotId }` | **The concurrency-critical endpoint** — see `ARCHITECTURE.md` §5.1 and `backend/tests/integration/booking.test.mts`. `409` if the slot is no longer open. |
 | `GET /appointments/mine` | patient | — | Caller's own appointments, most recent first. |
+| `PATCH /appointments/:appointmentId/status` | doctor (treating doctor only) | `{ status: 'completed'\|'cancelled'\|'no_show' }` | Lifecycle transition out of `scheduled` — the server-side state machine; anything else is `409`. A referral-origin appointment's transition also cascades into the referral in the same transaction (see Referrals below, PRD §8.2.3 / issue #67). Cancelling frees a still-future slot back to `open`. |
+| `PATCH /appointments/:appointmentId/cancel` | patient (own appointment) | — | Patient self-cancel — the "patient cancels" trigger of the same cascade. `scheduled` only; a patient can never mark completed/no_show. |
+
+## Patients (`/patients`) — `backend/src/modules/patients`
+
+| Method & path | Auth | Body | Notes |
+|---|---|---|---|
+| `GET /patients/me` | patient | — | Caller's own `PatientProfile` (includes the `patientProfileId` the referral flow references). Own-profile only — no cross-patient reads in v1. |
+
+## Referrals (`/referrals`) — `backend/src/modules/referrals`
+
+Phase 3 minimal path (issues #5/#7/#67). A referral snapshots `snapshotNotes` at creation (immutable — later edits elsewhere can't rewrite what the specialist sees, hard rule 3); the intake half of the snapshot (`snapshotIntakeId`) is still deferred to issue #1/#5. v1 requires a concrete `targetDoctorId` — the specialty-only routing rule is an open design gap (`ARCHITECTURE.md` §6.1.2, issue #6).
+
+| Method & path | Auth | Body | Notes |
+|---|---|---|---|
+| `POST /referrals` | doctor (verified email) | `{ patientProfileId, targetDoctorId, targetSpecialtyId?, snapshotNotes }` | Creates a `pending` referral. `404` if the patient or target doctor doesn't exist. |
+| `POST /referrals/:referralId/accept` | patient (the referral's patient, verified email) | `{ availabilitySlotId }` | One transaction: conditional `pending → accepted`, then the pre-populated appointment (origin `referral`, linked both ways) via the same slot-claim primitive as booking. The slot must belong to the referral's target doctor (`409` otherwise). No re-intake — the snapshot travels on the referral (FR-8). |
+| `POST /referrals/:referralId/decline` | patient (the referral's patient) | — | `pending → declined` only. To leave an accepted referral, cancel its appointment — the cascade returns the referral to `pending`, from which declining works. |
+| `GET /referrals/mine` | patient | — | The caller's referrals, most recent first. |
+| `GET /referrals/created` | doctor | — | Referrals the caller created — including ones the cascade expired after repeated no-shows (`referringDoctorNotifiedAt` set). |
+
+### Cascade rules (issue #67, PRD §8.2.3)
+
+When a **referral-origin** appointment reaches a terminal status, the referral moves in the same transaction (through the referrals service — the appointments module never writes the referral table):
+
+| Appointment transition | Referral becomes |
+|---|---|
+| `cancelled` | `pending` (re-bookable; snapshot intact; a still-future slot is released back to `open`) |
+| `no_show` | `pending`, `noShowCount` +1 — or `expired` once `noShowCount` reaches 2, with `referringDoctorNotifiedAt` set |
+| `completed` | `completed` |
+
+Every cascade write is a conditional update (referral must still be `accepted` and still point at that appointment), so a hook that fires twice is a no-op; the appointment transition itself is likewise a conditional `UPDATE ... WHERE status = 'scheduled'`. Integration-tested per transition pair in `backend/tests/integration/referral-cascade.test.mts`.
+
+## Payments (`/payments`) — `backend/src/modules/payments`
+
+See `docs/adr/0004-custodial-payments-v1.md` and the payments section of `ROADMAP.md` Phase 5.5 for the current (custodial v1, admin-triggered release/refund) endpoints.
 
 ## Not yet implemented
 
-Everything else in `ARCHITECTURE.md` §3's module list (`patients`,
-`facilities`, `consultations`, `referrals`, `prescriptions`, `lab-orders`,
-`pharmacy-orders`, `payments`, `notifications`) has no routes yet — Phase
-2 onward, see `ROADMAP.md`.
+Everything else in `ARCHITECTURE.md` §3's module list (`facilities`,
+`consultations`, `prescriptions`, `lab-orders`, `pharmacy-orders`,
+`notifications`) has no routes yet — Phase 2/4/5/6 onward, see
+`ROADMAP.md`.

@@ -58,7 +58,7 @@ Each module under `backend/src/modules/<name>/` owns its own `routes/`, `control
 
 Canonical source of truth: `backend/prisma/schema.prisma`. This section is the human-readable mirror — if they drift, the schema file wins and this doc should be corrected in the same PR.
 
-**Phase 1 models are now real** (User, PatientProfile, DoctorProfile, Specialty, DoctorSpecialty, FacilityProfile, FacilityCapability, AvailabilitySlot, Appointment) — migrated via `backend/prisma/migrations/20260914110638_init/`. Everything else below (§4.3 onward) is still the Phase 0 structural placeholder. Two intentional deviations from the sketches below, both flagged in the schema file itself: `Appointment.intakeId` is deferred (nullable-by-omission, not yet a column) since `IntakeForm` doesn't exist until Phase 2; `PatientProfile.guardianUserId` is a plain string with no FK relation, since the minor/dependent consent model (§8.2.5 in PRD.md) is still an open question, not resolved here.
+**Phase 1 models are now real** (User, PatientProfile, DoctorProfile, Specialty, DoctorSpecialty, FacilityProfile, FacilityCapability, AvailabilitySlot, Appointment) — migrated via `backend/prisma/migrations/20260914110638_init/`. **Referral is real too** (Phase 3 minimal path — issues #5/#7/#67: doctor-initiated creation, patient accept/decline with an auto-generated appointment, and the §5.2.1 cascade rules), migrated via `backend/prisma/migrations/20261016120000_referral_cascade/`; its `sourceConsultationId`/`snapshotIntakeId` FKs are still deferred (Consultation/IntakeForm are Phase 2 — issues #1/#4/#5). Everything else below (§4.3 onward) is still the Phase 0 structural placeholder. Two intentional deviations from the sketches below, both flagged in the schema file itself: `Appointment.intakeId` is deferred (nullable-by-omission, not yet a column) since `IntakeForm` doesn't exist until Phase 2; `PatientProfile.guardianUserId` is a plain string with no FK relation, since the minor/dependent consent model (§8.2.5 in PRD.md) is still an open question, not resolved here.
 
 ### 4.1 User / Role model
 ```
@@ -107,10 +107,14 @@ AvailabilitySlot
 
 Appointment
   id, patient_profile_id, doctor_profile_id, availability_slot_id (FK, unique)
-  intake_id (FK -> IntakeForm)
+  intake_id (FK -> IntakeForm)          # still TODO — IntakeForm is Phase 2 (issue #1)
   status (enum: scheduled|completed|cancelled|no_show)
   origin (enum: direct_booking|referral), referral_id (nullable FK -> Referral)
   created_at, updated_at
+  # Lifecycle (issue #3's slice, built as part of issue #67): only
+  # scheduled → completed|cancelled|no_show, enforced server-side by a
+  # conditional UPDATE (see §5.2.1). Cancelling a future slot releases it
+  # back to `open`; completed/no_show keep it booked (the time is spent).
 
 IntakeForm
   id, patient_profile_id, symptoms (structured: array of {symptom, duration, severity}), free_text_notes
@@ -128,15 +132,45 @@ Consultation
 ### 4.4 Referral
 ```
 Referral
-  id, source_consultation_id (FK)
-  referring_doctor_id, target_specialty_id, target_doctor_id (nullable)
-  snapshot_intake_id (FK -> IntakeForm, copy reference, immutable)
-  snapshot_notes (text copy of the referring consultation notes at time of referral — immutable)
+  id, source_consultation_id (FK — still TODO, issue #5: Consultation isn't a real record yet)
+  patient_profile_id (FK)
+  referring_doctor_id (FK -> DoctorProfile)
+  target_doctor_id (FK -> DoctorProfile — required in v1; the "which
+    specialist gets a specialty-only referral" routing rule is an
+    unresolved design gap, §6.1.2 / issue #6, not silently defaulted)
+  target_specialty_id (nullable FK -> Specialty — optional denormalised label)
+  snapshot_intake_id (FK -> IntakeForm, copy reference, immutable — still TODO, issues #1/#5)
+  snapshot_notes (text copy of the referring context at time of referral — immutable; LIVE as of issue #67)
   status (enum: pending|accepted|declined|completed|expired)
-  resulting_appointment_id (nullable FK -> Appointment)
+  no_show_count (int, default 0 — how many of its appointments no-showed)
+  referring_doctor_notified_at (nullable — set when repeated no-shows expire the referral; Phase 6's dispatch layer will read this flag)
+  resulting_appointment_id (nullable FK -> Appointment, unique — the appointment this referral currently produced; kept when expired, cleared back to null when a cancelled/no-showed appointment returns the referral to pending)
   created_at, updated_at
 ```
 Design note: `snapshot_notes` and `snapshot_intake_id` deliberately duplicate data rather than pointing live at `Consultation.notes`, so a later edit to the original consultation can never silently change what the specialist already acted on (PRD hard question 8.1.4).
+
+Referral state diagram (issue #67, PRD §8.2.3 — cascade rules; issue #8's
+time-based expiry for never-accepted referrals is a separate, still-open
+transition into `expired`):
+```
+                    accept (patient; books the
+                    pre-populated appointment,
+                    FR-8 — snapshot reused,
+                    no re-intake)
+        ┌──────────► accepted ──────────────────────────────┐
+        │              │                                    │
+ pending│              │ referral-origin appointment        │ completed
+       │              │ no_show (count++)                   ▼
+       │              ├──────────► pending (count < 2)   completed
+        │              │            re-bookable
+        │              │ no_show (count ≥ 2)
+        │              ▼
+        │            expired (+ referring_doctor_notified_at
+        │                     — the flag to the referring doctor)
+ decline│
+        └──────────► declined (terminal)
+```
+Every edge out of `accepted` fires inside the same transaction as the appointment's status change, through the referrals service's conditional updates (`applyAppointmentOutcome`) — a hook that fires twice matches zero rows and no-ops, so the cascade is idempotent by construction. `cancelled` also releases a still-future slot back to `open` (via the availability service) so re-booking isn't fighting a phantom reservation.
 
 ### 4.5 Prescriptions (versioned, append-only)
 ```
@@ -205,10 +239,17 @@ LoginAttempt (issue #35)
 3. On success, `Appointment` is created referencing the now-`booked` slot.
 
 ### 5.2 Referral
-1. Doctor closes a `Consultation` with outcome `referred`, selects `target_specialty` (+ optional specific doctor).
+1. Doctor closes a `Consultation` with outcome `referred`, selects `target_specialty` (+ optional specific doctor). *(v1 of the implementation, issue #67's PR, creates the referral directly from the doctor — re-wiring creation through a real `Consultation` record is issue #5's scope.)*
 2. Backend creates `Referral` with an immutable snapshot of intake + notes.
 3. Patient is notified, must **accept** (PRD OQ-3) before a new `Appointment` is generated against the target doctor's availability — accepting reuses the snapshot, so the patient does not re-fill intake.
 4. If no specialist is available in that specialty (PRD edge case 8.2.2), referral stays `pending` and surfaces to the patient as "waiting for a specialist" rather than silently failing — **not yet implemented, tracked in ROADMAP.**
+
+#### 5.2.1 Cascade when the referral-origin appointment changes status (issue #67, PRD §8.2.3)
+One transaction covers the appointment's conditional status UPDATE and, when the appointment carries a `referral_id`, the referral reaction through the referrals service (`applyAppointmentOutcome`):
+- `cancelled` → referral back to `pending` (re-bookable, snapshot intact); a future slot is released back to `open`.
+- `no_show` → referral back to `pending` with `no_show_count` incremented; at `no_show_count >= 2` the referral is `expired` instead, with `referring_doctor_notified_at` set.
+- `completed` → referral `completed`.
+All writes are conditional on the referral still being `accepted` *and still pointing at that appointment*, so a double-fired hook is a no-op. The transition itself is also a conditional `UPDATE ... WHERE status = 'scheduled'` — same discipline as §5.1's booking guarantee, applied to lifecycle state.
 
 ### 5.3 Order issuance and fulfillment
 1. Specialist issues `Prescription` and/or `LabOrder` from a `Consultation`.
@@ -228,7 +269,7 @@ LoginAttempt (issue #35)
 
 ### 6.2 What edge cases are we missing (architecture-level)?
 1. What happens to `AvailabilitySlot.status = 'held'` if a booking transaction fails/times out mid-flight — is there a TTL to release the hold? (Needed or slots leak into permanent limbo.)
-2. Referral `expired` status exists in the enum but no expiry job is designed yet — orphaned referrals (PRD 8.1.3 sibling problem).
+2. Referral `expired` status now has **one** real transition (repeated no-shows of the referral-origin appointment — §4.4/§5.2.1, issue #67), but the *time-based* expiry job for referrals that are simply never accepted (PRD 8.1.3 sibling problem, issue #8) still isn't designed.
 3. No schema support yet for a doctor working across multiple facilities/locations (PRD edge case 6) — `AvailabilitySlot` currently assumes one calendar per doctor.
 4. No audit-log table — every FR around auditability (PRD §7) currently relies on `created_at/updated_at` timestamps only, which is not sufficient for "who changed what." A dedicated `AuditEvent` table is likely needed before this ships to real patients.
 5. CSRF on the cookie-authenticated routes — the refresh cookie has to be `SameSite=None; Secure` (the Pages frontend is a different site — see `docs/adr/0003`), which means any site the patient visits can make their browser send it to `/auth/refresh` and `/auth/logout`. **Resolved 2026-10-15 (issue #37):** a per-session CSRF token is bound into the refresh token and required in the `X-CSRF-Token` header, the `Origin` header is validated against an explicit allowlist, and CORS is now a per-environment allowlist (`CORS_ORIGINS`) instead of one configured string. The double-submit cookie pattern — the usual answer — is *not* usable here: a cookie set by this API is a third-party cookie to `docforum.github.io`, so the frontend's JavaScript can never read it; the token travels in the login/refresh response body instead. A request with no `Origin` (curl, server-to-server) is allowed through the Origin check but still needs the token. See `backend/src/middleware/csrf.ts`, and `docs/api/README.md` for what the client must send. Consequence: refresh cookies issued before this change carry no `csrf` claim and are rejected, i.e. existing sessions need one re-login.

@@ -4,8 +4,11 @@
 //
 // STATUS: Phase 1 models (User/PatientProfile/DoctorProfile/FacilityProfile/
 // Specialty/DoctorSpecialty/FacilityCapability/AvailabilitySlot/Appointment)
-// are fleshed out and migrated. Everything below the Phase 1 marker is still
-// the Phase 0 structural placeholder — see ROADMAP.md.
+// are fleshed out and migrated. Referral is now real too (Phase 3 minimal
+// path — issues #5/#7/#67: creation, patient accept/decline with an
+// auto-generated appointment, and the cascade rules of PRD §8.2.3).
+// Everything else below the Phase 1 marker is still the Phase 0 structural
+// placeholder — see ROADMAP.md.
 
 generator client {
   provider = "prisma-client-js"
@@ -180,6 +183,7 @@ model PatientProfile {
   user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   appointments   Appointment[]
   paymentIntents PaymentIntent[]
+  referrals      Referral[]
 }
 
 model DoctorProfile {
@@ -194,6 +198,8 @@ model DoctorProfile {
   specialties       DoctorSpecialty[]
   availabilitySlots AvailabilitySlot[]
   appointments      Appointment[]
+  referralsCreated  Referral[]         @relation("ReferralReferringDoctor")
+  referralsTargeted Referral[]         @relation("ReferralTargetDoctor")
 
   @@index([verificationStatus])
 }
@@ -273,18 +279,27 @@ model Appointment {
   availabilitySlotId String            @unique
   status             AppointmentStatus @default(scheduled)
   origin             AppointmentOrigin @default(direct_booking)
-  createdAt          DateTime          @default(now())
-  updatedAt          DateTime          @updatedAt
+  // Phase 3 (issue #67): set only when origin = 'referral' — the link the
+  // cascade rules (PRD §8.2.3) react to when this appointment is later
+  // completed/cancelled/no-showed. Nullable on purpose: direct bookings
+  // have no referral behind them.
+  referralId       String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 
   patientProfile   PatientProfile   @relation(fields: [patientProfileId], references: [id])
   doctorProfile    DoctorProfile    @relation(fields: [doctorProfileId], references: [id])
   availabilitySlot AvailabilitySlot @relation(fields: [availabilitySlotId], references: [id])
+  referral         Referral?        @relation("ReferralOriginatedAppointments", fields: [referralId], references: [id])
+  // Non-owning side of Referral.resultingAppointmentId (the FK lives on
+  // Referral) — which referral currently points at this appointment as
+  // the one it produced.
+  referralResultOf Referral?        @relation("ReferralResultingAppointment")
 
   // TODO Phase 2: intakeId (FK -> IntakeForm). PRD FR-5 requires intake
   // before confirmation, not enforced yet — booking works without it in
   // Phase 1 so the concurrency-safety work isn't blocked on IntakeForm
   // existing. Flagged, not silently dropped.
-  // TODO Phase 3: referralId (nullable FK -> Referral).
 }
 
 // =========================================================================
@@ -306,16 +321,53 @@ model Consultation {
   // TODO: appointmentId (unique)
 }
 
+// Phase 3 (issues #5/#7/#67, minimal path): real fields for referral
+// creation, patient accept/decline with an auto-generated appointment, and
+// the cascade rules that keep the referral honest when that appointment is
+// later cancelled or no-showed (PRD §8.2.3). Still deferred: the
+// `sourceConsultationId` FK (issue #5 — Consultation isn't a real record
+// yet) and `snapshotIntakeId` (issues #1/#5 — IntakeForm isn't real yet).
+// `snapshotNotes` is the live part of the FR-7/FR-8 snapshot guarantee:
+// immutable text copied at creation, never re-read from a consultation.
 model Referral {
   id             String         @id @default(uuid())
   status         ReferralStatus @default(pending)
+  patientProfileId   String
+  referringDoctorId  String
+  // Routing rule for "no specific target doctor" is an unresolved design
+  // gap (ARCHITECTURE.md §6.1.2, issue #6) — so v1 requires a concrete
+  // target doctor; targetSpecialtyId is an optional, denormalised label.
+  targetDoctorId     String
+  targetSpecialtyId  String?
   snapshotNotes  String
+  // Cascade bookkeeping (issue #67): how many times a referral-origin
+  // appointment has no-showed, and the "the referring doctor must know"
+  // flag set when repeated no-shows expire the referral. Both live on the
+  // referral (not a Notification row) because Phase 6's dispatch layer
+  // doesn't exist yet — the flag is the seam it will read.
+  noShowCount          Int       @default(0)
+  referringDoctorNotifiedAt DateTime?
+  // The appointment this referral currently produced (null while pending/
+  // declined, or after a cancelled/no-showed appointment returns it to
+  // pending). Kept pointing at the last no-show when expired — that
+  // appointment is why it expired.
+  resultingAppointmentId String? @unique
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
-  // TODO: sourceConsultationId, referringDoctorId, targetSpecialtyId,
-  // targetDoctorId (nullable), snapshotIntakeId, resultingAppointmentId (nullable)
-  // IMPORTANT: snapshotNotes / snapshotIntakeId must be copies, not live
-  // references — see ARCHITECTURE.md §4.4 design note.
+
+  patientProfile  PatientProfile @relation(fields: [patientProfileId], references: [id])
+  referringDoctor DoctorProfile  @relation("ReferralReferringDoctor", fields: [referringDoctorId], references: [id])
+  targetDoctor    DoctorProfile  @relation("ReferralTargetDoctor", fields: [targetDoctorId], references: [id])
+  resultingAppointment Appointment? @relation("ReferralResultingAppointment", fields: [resultingAppointmentId], references: [id])
+  // Every appointment this referral ever produced (including cancelled/
+  // no-showed ones) — history survives the resultingAppointmentId link
+  // being cleared when the referral returns to pending.
+  appointments Appointment[] @relation("ReferralOriginatedAppointments")
+
+  @@index([patientProfileId])
+  @@index([referringDoctorId])
+  @@index([targetDoctorId])
+  @@index([status])
 }
 
 model Prescription {

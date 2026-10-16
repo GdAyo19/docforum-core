@@ -46,3 +46,21 @@ export async function claimOpenSlot(db: DbClient, slotId: string): Promise<boole
   });
   return result.count === 1;
 }
+
+/**
+ * Releases a booked slot back to `open` — but only while its start time is
+ * still in the future. A past slot being freed by a late cancellation is
+ * not bookable material; reopening it would let a stale claim resurrect a
+ * visit window that has already passed (claimOpenSlot itself doesn't check
+ * the clock — findOpenSlots does, but direct slot-id claims exist).
+ *
+ * Same conditional-UPDATE shape as claimOpenSlot: atomic at the DB level,
+ * callable with a transaction client from appointments/services.
+ */
+export async function releaseBookedSlotIfFuture(db: DbClient, slotId: string): Promise<boolean> {
+  const result = await db.availabilitySlot.updateMany({
+    where: { id: slotId, status: 'booked', startTime: { gt: new Date() } },
+    data: { status: 'open' },
+  });
+  return result.count === 1;
+}

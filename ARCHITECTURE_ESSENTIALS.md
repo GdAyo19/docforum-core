@@ -22,7 +22,7 @@ Quick-reference only. Full reasoning lives in `ARCHITECTURE.md`. Full product sc
 `User` → `PatientProfile | DoctorProfile | FacilityProfile`
 `DoctorProfile` —< `DoctorSpecialty` >— `Specialty`
 `AvailabilitySlot` (doctor's calendar) → `Appointment` → `IntakeForm`, `Consultation`
-`Consultation` → (outcome=referred) → `Referral` (snapshot!) → new `Appointment`
+`Consultation` → (outcome=referred) → `Referral` (snapshot!) → new `Appointment` — Referral is real (Phase 3 minimal path: create/accept/decline + cascade rules on referral-origin appointment transitions — cancelled → pending, no_show ×2 → expired, completed → completed; see ARCHITECTURE.md §5.2.1)
 `Consultation` → `Prescription`(+`PrescriptionItem`) / `LabOrder`(+`LabResult`)
 `FulfillmentRecord` (facility-owned) references an order but doesn't mutate it.
 `User` → `EmailVerificationToken` (Phase 8, issue #34 — hashed/expiring, single-use; `User.emailVerifiedAt` gates booking + payment mutations, never login/browsing).
@@ -38,7 +38,7 @@ Quick-reference only. Full reasoning lives in `ARCHITECTURE.md`. Full product sc
 
 ## Known unresolved design gaps (do not silently "fix" without flagging in PR description)
 - No routing rule yet for a referral with no specific target doctor (which specialist gets it?).
-- No expiry/TTL job for held slots or pending referrals — currently just an enum value with no worker.
+- No expiry/TTL job for held slots or pending referrals — the no-show cascade (repeated no-shows expire a referral, issue #67) exists, but time-based expiry of never-accepted referrals (issue #8) and held-slot TTL (issue #19) are still just enum values with no worker.
 - Polymorphic `FulfillmentRecord.order_id` is a sketch, not final — may need splitting into two tables.
 - No `AuditEvent` table yet, despite PRD requiring auditability — needed before real patient data.
 - No email/SMS provider integrated yet (Phase 6, issue #17) — email verification (issue #34) therefore can't deliver its link on a hosted deployment; `backend/scripts/mark-email-verified.mjs` is the interim operator path.

@@ -42,22 +42,23 @@ for status and issue links.
 - [x] Doc reconciliation: PRD §8.1.1 and ARCHITECTURE §6.1.1 marked resolved in place.
 
 ## Phase 2 — Intake, appointments, consultations
-**Status: Not started — unblocked (Phase 1 is done). Scoped into issues #1–#4 and #23.**
+**Status: Not started — unblocked (Phase 1 is done). Scoped into issues #1–#4 and #23. One slice of #3 has landed early — see below.**
 - [ ] `IntakeForm` model + structured symptom entry (not free-text-only, per PRD FR-5). Tracked as [issue #1](https://github.com/DocForum/docforum-core/issues/1) (Medium, 150 pts).
 - [ ] Booking flow requires intake before confirmation. Tracked as [issue #2](https://github.com/DocForum/docforum-core/issues/2) (Medium, 150 pts) — depends on #1.
-- [ ] `Appointment` lifecycle (`scheduled → completed/cancelled/no_show`) + doctor's today view. Tracked as [issue #3](https://github.com/DocForum/docforum-core/issues/3) (Medium, 150 pts).
+- [ ] `Appointment` lifecycle (`scheduled → completed/cancelled/no_show`) + doctor's today view. Tracked as [issue #3](https://github.com/DocForum/docforum-core/issues/3) (Medium, 150 pts) — **partially built 2026-10-16 as part of issue #67** (`PATCH /appointments/:id/status` doctor-side state machine + patient self-cancel, conditional-UPDATE enforced); the doctor's-today view remains open on #3.
 - [ ] `Consultation` record + outcome (`resolved | referred | follow_up_needed`). Tracked as [issue #4](https://github.com/DocForum/docforum-core/issues/4) (High, 200 pts).
 - [ ] Doctor discovery: specialty catalog, doctor ↔ specialty assignment, public `GET /doctors?specialty=` (verified doctors only). Nothing in `backend/src` touched `Specialty`/`DoctorSpecialty` before this; `docforum-web` issue #1 depends on it. Tracked as [issue #23](https://github.com/DocForum/docforum-core/issues/23) (Medium, 150 pts).
 - [ ] Patient-facing view: my intake history. Not yet split into its own issue — small enough to fold into whichever of the above lands last, or split out later if it grows.
 
 ## Phase 3 — Referrals
-**Status: Not started (blocked by Phase 2). Scoped into issues #5–#8.**
-- [ ] `Referral` model with **immutable snapshot** of intake + notes (ARCHITECTURE.md §4.4 design note — do not implement as a live pointer), plus the "zero verified doctors in target specialty" edge case (PRD §8.2.2). Tracked as [issue #5](https://github.com/DocForum/docforum-core/issues/5) (Medium, 150 pts).
+**Status: In progress. The cascade rules (issue #67) are built and tested — see below — which required landing a minimal create/accept/decline path and the appointment-lifecycle trigger early. Issues #5–#8 remain open for the rest.**
+- [ ] `Referral` model with **immutable snapshot** of intake + notes (ARCHITECTURE.md §4.4 design note — do not implement as a live pointer), plus the "zero verified doctors in target specialty" edge case (PRD §8.2.2). Tracked as [issue #5](https://github.com/DocForum/docforum-core/issues/5) (Medium, 150 pts). **Partial:** the model is real (migrated `20261016120000_referral_cascade`) with a live `snapshotNotes` copy and doctor-initiated creation; `sourceConsultationId`/`snapshotIntakeId` (creation *from a Consultation*, intake copy) stay on #5.
 - [ ] Referral creation from a `Consultation` with outcome `referred` — folded into issue #5 above.
-- [ ] Routing rule for referrals with no specific `target_doctor_id` (ARCHITECTURE.md §6.1.2 — currently an unresolved design gap; this phase must resolve or explicitly re-scope it). Tracked as [issue #6](https://github.com/DocForum/docforum-core/issues/6) (High, 200 pts) — an ADR.
-- [ ] Patient accept/decline flow (PRD OQ-3 resolved: patient must confirm). Tracked as [issue #7](https://github.com/DocForum/docforum-core/issues/7) (Medium, 150 pts) — depends on #5.
-- [ ] Accepted referral auto-generates a pre-populated `Appointment` against the target doctor/specialty — patient does not re-enter intake (PRD FR-8, the core value prop) — folded into issue #7 above.
-- [ ] Referral expiry job (addresses PRD §8.1.3 "orphaned" pattern for referrals specifically). Tracked as [issue #8](https://github.com/DocForum/docforum-core/issues/8) (Medium, 150 pts) — depends on #5.
+- [ ] Routing rule for referrals with no specific `target_doctor_id` (ARCHITECTURE.md §6.1.2 — currently an unresolved design gap; this phase must resolve or explicitly re-scope it). Tracked as [issue #6](https://github.com/DocForum/docforum-core/issues/6) (High, 200 pts) — an ADR. v1 of #67 requires a concrete target doctor rather than guessing a routing rule.
+- [ ] Patient accept/decline flow (PRD OQ-3 resolved: patient must confirm). Tracked as [issue #7](https://github.com/DocForum/docforum-core/issues/7) (Medium, 150 pts) — depends on #5. **Partial:** accept (books the pre-populated appointment against the target doctor via the same slot-claim primitive as booking) and decline (pending-only) shipped as part of #67; whatever #7 still needs beyond this stays open on #7.
+- [ ] Accepted referral auto-generates a pre-populated `Appointment` against the target doctor/specialty — patient does not re-enter intake (PRD FR-8, the core value prop) — folded into issue #7 above. **Partial:** the appointment half landed with #67 (origin `referral`, `referral_id` link); the intake-reuse half waits on IntakeForm (#1).
+- [ ] **Cascade rules when a referral-origin appointment is cancelled or no-shows (PRD §8.2.3) — Done**, merged as the `feat/cascade-rules-when-a-referral-origin-appointment` PR. Cancelled → referral back to `pending` (re-bookable, snapshot reused, future slot released); no_show → `pending` + `noShowCount++`, second no-show → `expired` with `referringDoctorNotifiedAt` set; completed → `completed`. All through the referrals service (`applyAppointmentOutcome`), conditional-update idempotent, integration-tested per transition pair (`backend/tests/integration/referral-cascade.test.mts`). Tracked as [issue #67](https://github.com/DocForum/docforum-core/issues/67) (High, 200 pts).
+- [ ] Referral expiry job (addresses PRD §8.1.3 "orphaned" pattern for referrals specifically — *time-based* expiry; distinct from #67's no-show expiry). Tracked as [issue #8](https://github.com/DocForum/docforum-core/issues/8) (Medium, 150 pts) — depends on #5.
 - [ ] Doc reconciliation: update ARCHITECTURE_ESSENTIALS.md "Known unresolved design gaps" once routing rule + expiry exist — part of issue #6's DoD.
 
 ## Phase 4 — Orders: prescriptions & lab orders
@@ -380,3 +381,34 @@ for status and issue links.
   tests assert a
   forged cross-origin request is rejected while the legitimate cross-site
   client still succeeds.
+- 2026-10-16 — Built the referral cascade rules (Phase 3, issue #67, PRD
+  §8.2.3): a referral-origin appointment's terminal transition now moves
+  the referral in the same transaction — cancelled → back to `pending`
+  (re-bookable; re-accepting reuses the immutable snapshot per FR-8; the
+  future slot is released back to `open`), no_show → back to `pending`
+  with `noShowCount` incremented, and the second no-show → `expired` with
+  `referringDoctorNotifiedAt` set (the flag to the referring doctor),
+  completed → `completed` (closing FR-9's loop). All writes go through
+  the referrals service (`applyAppointmentOutcome`) as conditional
+  updates — appointments never touch the referral table directly, and a
+  double-fired hook is a no-op (integration-tested). Because the issue's
+  declared dependencies (#3 appointment lifecycle, #7 accept/decline +
+  auto-generated appointment) hadn't landed, this PR carries the minimal
+  foundation for both: `PATCH /appointments/:id/status` (doctor-side
+  `scheduled → completed|cancelled|no_show` state machine, conditional
+  UPDATE) + patient self-cancel, and a real `Referral` model
+  (migration `20261016120000_referral_cascade`) with doctor-initiated
+  creation, patient accept (books the `origin: 'referral'` appointment
+  through the same slot-claim primitive as booking) and decline. #3's
+  today-view, and #5's consultation-linked creation / intake snapshot /
+  routing (#6) / time-based expiry (#8) remain open on their own issues —
+  flagged as partial in the phase sections above, not silently claimed.
+  New endpoints: `POST /referrals`, `POST /referrals/:id/{accept,decline}`,
+  `GET /referrals/{mine,created}`, `PATCH /appointments/:id/status`,
+  `PATCH /appointments/:id/cancel`, `GET /patients/me` (the patient's own
+  profile id, which the referral flow needs to reference). PRD §8.2.3
+  marked resolved; ARCHITECTURE §4.2/§4.4/§5.2 (state diagram + cascade)
+  and docs/api/README.md updated. `backend/tests/integration/
+  referral-cascade.test.mts` — each transition pair, idempotent double
+  fire, decline, access control, wrong-doctor slot, concurrent accept —
+  passing alongside the existing suites.
